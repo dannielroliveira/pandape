@@ -1,0 +1,1244 @@
+#include "totvs.ch"
+#include "tlpp-core.th"
+
+//-------------------------------------------------------------------
+/*/{Protheus.doc} U_PPJOBPROC
+Job para processar fila de webhooks do Pandapé
+CORRIGIDO: Utiliza tabelas padrão SQG e SQS + tabelas específicas
+@type function
+@author Daniel Ribeiro de Oliveira
+@since 07/09/2025
+@version 3.0
+@param aParams - Array com parâmetros (empresa, filial)
+/*/
+//-------------------------------------------------------------------
+
+namespace pandape.job
+
+User Function PPJOBPROC(aParams)
+
+    local cEmpresa      as character
+    local cFil          as character
+    local lHabilitado   as logical
+    local nIntervalo    as numeric
+    local nLote         as numeric
+
+    default aParams := {"03", "01"}
+
+    cEmpresa := aParams[1]
+    cFil     := aParams[2]
+
+    // Preparar ambiente
+    if type('cEmpAnt') <> 'C'
+        RpcSetType(3)
+        RpcSetEnv(cEmpresa, cFil,,,,"")
+    endif
+
+    // Verificar se job está habilitado
+    lHabilitado := SuperGetMV("MV_PANDJOB", .F., .T.)
+    if !lHabilitado
+        ConOut("[PPJOBPROC] Job desabilitado via parâmetro MV_PANDJOB")
+        return
+    endif
+
+    // Obter configurações
+    nIntervalo := SuperGetMV("MV_PANDINT", .F., 5) * 60  // Converter minutos para segundos
+    nLote      := SuperGetMV("MV_PANDLOT", .F., 50)
+
+    ConOut("[PPJOBPROC] ===============================")
+    ConOut("[PPJOBPROC] JOB PANDAPÉ INICIADO")
+    ConOut("[PPJOBPROC] Empresa: " + cEmpresa + " Filial: " + cFil)
+    ConOut("[PPJOBPROC] Intervalo: " + cValToChar(nIntervalo/60) + " minutos")
+    ConOut("[PPJOBPROC] Lote: " + cValToChar(nLote) + " registros")
+    ConOut("[PPJOBPROC] ===============================")
+
+    // Loop principal do job
+    while .T.
+
+        try
+            // Processar fila
+            ProcessarFila(nLote)
+
+        catch oErr
+            ConOut("[PPJOBPROC] Erro no processamento: " + oErr:Description)
+        endtry
+
+        // Aguardar intervalo
+        Sleep(nIntervalo * 1000) // Sleep em milissegundos
+
+        // Verificar se ainda deve continuar
+        lHabilitado := SuperGetMV("MV_PANDJOB", .F., .T.)
+        if !lHabilitado
+            ConOut("[PPJOBPROC] Job desabilitado - Encerrando")
+            exit
+        endif
+
+    enddo
+
+    ConOut("[PPJOBPROC] Job finalizado")
+
+return
+
+//-------------------------------------------------------------------
+/*/{Protheus.doc} ProcessarFila
+Processa registros pendentes na fila ZPA
+@type function
+@author Daniel Ribeiro de Oliveira
+@since 07/09/2025
+@param nLote - Quantidade máxima de registros para processar
+/*/
+//-------------------------------------------------------------------
+Static Function ProcessarFila(nLote)
+
+    local aRegistros    as array
+    local nI            as numeric
+    local nProcessados  as numeric
+    local nSucessos     as numeric
+    local nErros        as numeric
+
+    aRegistros := BuscarRegistrosPendentes(nLote)
+    nProcessados := 0
+    nSucessos := 0
+    nErros := 0
+
+    if Len(aRegistros) == 0
+        ConOut("[PROCESSAR-FILA] Nenhum registro pendente encontrado")
+        return
+    endif
+
+    ConOut("[PROCESSAR-FILA] Processando " + cValToChar(Len(aRegistros)) + " registros")
+
+    for nI := 1 to Len(aRegistros)
+
+        if ProcessarRegistro(aRegistros[nI])
+            nSucessos++
+        else
+            nErros++
+        endif
+
+        nProcessados++
+
+    next nI
+
+    ConOut("[PROCESSAR-FILA] Processamento concluído:")
+    ConOut("[PROCESSAR-FILA] - Total: " + cValToChar(nProcessados))
+    ConOut("[PROCESSAR-FILA] - Sucessos: " + cValToChar(nSucessos))
+    ConOut("[PROCESSAR-FILA] - Erros: " + cValToChar(nErros))
+
+return
+
+//-------------------------------------------------------------------
+/*/{Protheus.doc} BuscarRegistrosPendentes
+Busca registros com status pendente na ZPA
+@type function
+@author Daniel Ribeiro de Oliveira
+@since 07/09/2025
+@param nLote - Quantidade máxima de registros
+@return array Array com registros pendentes
+/*/
+//-------------------------------------------------------------------
+Static Function BuscarRegistrosPendentes(nLote)
+
+    local aRegistros    as array
+    local cQuery        as character
+    local cAlias        as character
+    local nMaxTentativas as numeric
+
+    aRegistros := {}
+    nMaxTentativas := SuperGetMV("MV_PANDRET", .F., 3)
+
+    cQuery := " SELECT ZPA_ID, ZPA_IDMATC, ZPA_IDPREC, ZPA_IDVAGA, "
+    cQuery += "        ZPA_IDREQ, ZPA_JSON AS JSON, ZPA_TENTAT "
+    cQuery += " FROM " + RetSqlName("ZPA") + " ZPA "
+    cQuery += " WHERE ZPA.D_E_L_E_T_ = ' ' "
+    cQuery += "   AND ZPA.ZPA_FILIAL = '" + xFilial("ZPA") + "' "
+    cQuery += "   AND ZPA.ZPA_STATUS = 'P' "
+    cQuery += "   AND ZPA.ZPA_ETAPA = 'Admissão finalizada' "
+    cQuery += "   AND ZPA.ZPA_TENTAT < " + cValToChar(nMaxTentativas)
+    cQuery += " ORDER BY ZPA_DTINCL, ZPA_HRINCL "
+
+    cAlias := MPSysOpenQuery(cQuery)
+
+    while (cAlias)->(!Eof()) .and. Len(aRegistros) < nLote
+
+        AAdd(aRegistros, {;
+            "ID"        , (cAlias)->ZPA_ID,;
+            "IDMATC"    , AllTrim((cAlias)->ZPA_IDMATC),;
+            "IDPREC"    , AllTrim((cAlias)->ZPA_IDPREC),;
+            "IDVAGA"    , AllTrim((cAlias)->ZPA_IDVAGA),;
+            "IDREQ"     , AllTrim((cAlias)->ZPA_IDREQ),;
+            "TENTATIV"  , (cAlias)->ZPA_TENTAT;
+        })
+
+        (cAlias)->(DbSkip())
+
+    enddo
+
+    (cAlias)->(DbCloseArea())
+
+return aRegistros
+
+//-------------------------------------------------------------------
+/*/{Protheus.doc} ProcessarRegistro
+Processa um registro individual da fila
+@type function
+@author Daniel Ribeiro de Oliveira
+@since 07/09/2025
+@param aRegistro - Array com dados do registro
+@return logical .T. se processado com sucesso
+/*/
+//-------------------------------------------------------------------
+Static Function ProcessarRegistro(aRegistro)
+
+    local lRet          as logical
+    local cId           as character
+    local cIdMatch      as character
+    local cIdPreColl    as character
+    local cIdVaga       as character
+    local cErro         as character
+    local oApi          as object
+    local oMatch        as json
+    local oPreColl      as json
+    local oVaga         as json
+
+    lRet := .F.
+    cErro := ""
+
+    // Extrair dados do registro
+    cId         := aRegistro[2]
+    cIdMatch    := aRegistro[4]
+    cIdPreColl  := aRegistro[6]
+    cIdVaga     := aRegistro[8]
+
+    ConOut("[PROCESSAR-REG] Processando ID: " + cId + " Match: " + cIdMatch)
+
+    try
+
+        // Atualizar tentativas
+        AtualizarTentativas(cId)
+
+        // Instanciar API
+        oApi := pandape.api.PANDAPE():new()
+
+        // Autenticar
+        if !oApi:authenticate()
+            cErro := "Falha na autenticação da API"
+            ConOut("[PROCESSAR-REG] " + cErro)
+            AtualizarStatusErro(cId, cErro)
+            return .F.
+        endif
+
+        // Buscar dados do match (contém CPF, experiências, estudos)
+        oMatch := oApi:getMatch(cIdMatch)
+        if oMatch == nil
+            cErro := "Match não encontrado: " + cIdMatch
+            ConOut("[PROCESSAR-REG] " + cErro)
+            AtualizarStatusErro(cId, cErro)
+            return .F.
+        endif
+
+        // Buscar dados do pré-colaborador (contém formulários)
+        oPreColl := oApi:getPreCollaborator(cIdPreColl)
+        if oPreColl == nil
+            cErro := "PreCollaborator não encontrado: " + cIdPreColl
+            ConOut("[PROCESSAR-REG] " + cErro)
+            AtualizarStatusErro(cId, cErro)
+            return .F.
+        endif
+
+        // Buscar dados da vaga
+        oVaga := oApi:getVacancy(cIdVaga)
+        if oVaga == nil
+            ConOut("[PROCESSAR-REG] Vaga não encontrada: " + cIdVaga + " - Criando vaga genérica")
+            oVaga := CriarVagaGenerica()
+        endif
+
+        // Validar dados obrigatórios do match
+        if !ValidarDadosObrigatorios(oMatch)
+            cErro := "Dados obrigatórios não encontrados no match"
+            ConOut("[PROCESSAR-REG] " + cErro)
+            AtualizarStatusErro(cId, cErro)
+            return .F.
+        endif
+
+        // Processar dados e gravar nas tabelas do Protheus
+        if ProcessarCandidato(oMatch, oPreColl, oVaga, cIdMatch)
+            AtualizarStatusSucesso(cId)
+            ConOut("[PROCESSAR-REG] Sucesso: " + cId)
+            lRet := .T.
+        else
+            cErro := "Erro ao processar dados do candidato"
+            ConOut("[PROCESSAR-REG] " + cErro)
+            AtualizarStatusErro(cId, cErro)
+        endif
+
+    catch oErr
+
+        if Empty(cErro)
+            cErro := oErr:Description
+        endif
+
+        AtualizarStatusErro(cId, cErro)
+        ConOut("[PROCESSAR-REG] Erro: " + cId + " - " + cErro)
+
+    endtry
+
+return lRet
+
+
+//-------------------------------------------------------------------
+/*/{Protheus.doc} AtualizarStatusSucesso
+Atualiza status para sucesso na ZPA
+@type function
+@author Daniel Ribeiro de Oliveira
+@since 07/09/2025
+@param cId - ID do registro na ZPA
+/*/
+//-------------------------------------------------------------------
+Static Function AtualizarStatusSucesso(cId)
+
+    DbSelectArea("ZPA")
+    ZPA->(DbSetOrder(1)) // ZPA_FILIAL+ZPA_ID
+
+    if ZPA->(DbSeek(xFilial("ZPA") + cId))
+        RecLock("ZPA", .F.)
+        ZPA->ZPA_STATUS  := "S"  // Sucesso
+        ZPA->ZPA_DTPROC  := Date()
+        ZPA->ZPA_HRPROC  := Time()
+        ZPA->ZPA_MSGERRO := ""
+        ZPA->(MsUnlock())
+    endif
+
+return
+
+
+//-------------------------------------------------------------------
+/*/{Protheus.doc} AtualizarTentativas
+Incrementa contador de tentativas na ZPA
+@type function
+@author Daniel Ribeiro de Oliveira
+@since 07/09/2025
+@param cId - ID do registro na ZPA
+/*/
+//-------------------------------------------------------------------
+Static Function AtualizarTentativas(cId)
+
+    DbSelectArea("ZPA")
+    ZPA->(DbSetOrder(1)) // ZPA_FILIAL+ZPA_ID
+
+    if ZPA->(DbSeek(xFilial("ZPA") + cId))
+        RecLock("ZPA", .F.)
+        ZPA->ZPA_TENTAT := ZPA->ZPA_TENTAT + 1
+        ZPA->(MsUnlock())
+    endif
+
+return
+
+
+//-------------------------------------------------------------------
+/*/{Protheus.doc} AtualizarStatusErro
+Atualiza status para erro na ZPA
+@type function
+@author Daniel Ribeiro de Oliveira
+@since 07/09/2025
+@param cId - ID do registro na ZPA
+@param cMsgErro - Mensagem de erro
+/*/
+//-------------------------------------------------------------------
+Static Function AtualizarStatusErro(cId, cMsgErro)
+
+    local nMaxTentativas as numeric
+
+    nMaxTentativas := SuperGetMV("MV_PANDRET", .F., 3)
+
+    DbSelectArea("ZPA")
+    ZPA->(DbSetOrder(1)) // ZPA_FILIAL+ZPA_ID
+
+    if ZPA->(DbSeek(xFilial("ZPA") + cId))
+        RecLock("ZPA", .F.)
+        
+        // Se atingiu máximo de tentativas, marca como erro definitivo
+        if ZPA->ZPA_TENTAT >= nMaxTentativas
+            ZPA->ZPA_STATUS := "E"  // Erro
+        endif
+        
+        ZPA->ZPA_DTPROC  := Date()
+        ZPA->ZPA_HRPROC  := Time()
+        ZPA->ZPA_MSGERR  := cMsgErro
+        ZPA->(MsUnlock())
+    endif
+
+return
+
+//-------------------------------------------------------------------
+/*/{Protheus.doc} GravarZES
+Grava estudos na tabela específica ZES
+@type function
+@author Daniel Ribeiro de Oliveira
+@since 07/09/2025
+@param oMatch - Dados do match
+@param cCpf - CPF do candidato
+@param cCurriculo - Código do currículo
+@return logical .T. se gravado com sucesso
+/*/
+//-------------------------------------------------------------------
+Static Function GravarZES(oMatch, cCpf, cCurriculo)
+
+    local lRet      as logical
+    local aStudies  as array
+    local nI        as numeric
+    local cId       as character
+
+    lRet := .T.
+
+    // Verificar se existem estudos
+    if !oMatch:hasProperty("studies")
+        ConOut("[GRAVAR-ZES] Nenhum estudo encontrado")
+        return .T.
+    endif
+
+    if ValType(oMatch['studies']) != "A"
+        ConOut("[GRAVAR-ZES] Studies não são um array")
+        return .T.
+    endif
+
+    aStudies := oMatch['studies']
+
+    ConOut("[GRAVAR-ZES] Processando " + cValToChar(Len(aStudies)) + " estudos")
+
+    for nI := 1 to Len(aStudies)
+
+        cId := GetSxeNum("ZES", "ZES_ID")
+        ConfirmSx8()
+
+        DbSelectArea("ZES")
+        RecLock("ZES", .T.)
+
+            ZES->ZES_FILIAL    := xFilial("ZES")
+            ZES->ZES_ID        := cId
+            ZES->ZES_CURRICULO := PadR(cCurriculo, TamSX3("ZES_CURRICULO")[1])
+            ZES->ZES_CPF       := PadR(cCpf, TamSX3("ZES_CPF")[1])
+            
+            if aStudies[nI]:hasProperty("study")
+                ZES->ZES_CURSO := PadR(AllTrim(aStudies[nI]['study']), TamSX3("ZES_CURSO")[1])
+            endif
+            
+            if aStudies[nI]:hasProperty("center")
+                ZES->ZES_INSTITUICAO := PadR(AllTrim(aStudies[nI]['center']), TamSX3("ZES_INSTITUICAO")[1])
+            endif
+            
+            if aStudies[nI]:hasProperty("idStudy1")
+                // Mapear nível baseado no idStudy1
+                do case
+                case aStudies[nI]['idStudy1'] == 2
+                    ZES->ZES_NIVEL := "CURSO"
+                case aStudies[nI]['idStudy1'] == 5
+                    ZES->ZES_NIVEL := "GRADUACAO"
+                case aStudies[nI]['idStudy1'] == 6
+                    ZES->ZES_NIVEL := "POS-GRADUACAO"
+                otherwise
+                    ZES->ZES_NIVEL := "OUTROS"
+                endcase
+            endif
+            
+            if aStudies[nI]:hasProperty("beginDate")
+                if !Empty(aStudies[nI]['beginDate'])
+                    ZES->ZES_DTINI := CToD(SubStr(aStudies[nI]['beginDate'], 1, 10))
+                endif
+            endif
+            
+            if aStudies[nI]:hasProperty("endDate")
+                if !Empty(aStudies[nI]['endDate'])
+                    ZES->ZES_DTFIM := CToD(SubStr(aStudies[nI]['endDate'], 1, 10))
+                endif
+            endif
+            
+            if aStudies[nI]:hasProperty("studyStatus")
+                ZES->ZES_STATUS := aStudies[nI]['studyStatus']
+            else
+                ZES->ZES_STATUS := 1  // 1=Concluído por padrão
+            endif
+            
+            ZES->ZES_DTINCL := Date()
+            ZES->ZES_HRINCL := Time()
+
+        ZES->(MsUnlock())
+
+    next nI
+
+return lRet
+
+//-------------------------------------------------------------------
+/*/{Protheus.doc} GravarZSK
+Grava skills na tabela específica ZSK
+@type function
+@author Daniel Ribeiro de Oliveira
+@since 07/09/2025
+@param oMatch - Dados do match
+@param cCpf - CPF do candidato
+@param cCurriculo - Código do currículo
+@return logical .T. se gravado com sucesso
+/*/
+//-------------------------------------------------------------------
+Static Function GravarZSK(oMatch, cCpf, cCurriculo)
+
+    local lRet      as logical
+    local aSkills   as array
+    local nI        as numeric
+    local cId       as character
+    local cSkill    as character
+
+    lRet := .T.
+
+    // Verificar se existem skills
+    if !oMatch:hasProperty("skills")
+        ConOut("[GRAVAR-ZSK] Nenhuma skill encontrada")
+        return .T.
+    endif
+
+    if ValType(oMatch['skills']) != "A"
+        ConOut("[GRAVAR-ZSK] Skills não são um array")
+        return .T.
+    endif
+
+    aSkills := oMatch['skills']
+
+    ConOut("[GRAVAR-ZSK] Processando " + cValToChar(Len(aSkills)) + " skills")
+
+    for nI := 1 to Len(aSkills)
+
+        cSkill := AllTrim(aSkills[nI])
+        
+        if !Empty(cSkill)
+            cId := GetSxeNum("ZSK", "ZSK_ID")
+            ConfirmSx8()
+
+            DbSelectArea("ZSK")
+            RecLock("ZSK", .T.)
+
+                ZSK->ZSK_FILIAL    := xFilial("ZSK")
+                ZSK->ZSK_ID        := cId
+                ZSK->ZSK_CURRICULO := PadR(cCurriculo, TamSX3("ZSK_CURRICULO")[1])
+                ZSK->ZSK_CPF       := PadR(cCpf, TamSX3("ZSK_CPF")[1])
+                ZSK->ZSK_SKILL     := PadR(cSkill, TamSX3("ZSK_SKILL")[1])
+                ZSK->ZSK_NIVEL     := "MEDIO"  // Nível médio por padrão
+                ZSK->ZSK_DTINCL    := Date()
+                ZSK->ZSK_HRINCL    := Time()
+
+            ZSK->(MsUnlock())
+        endif
+
+    next nI
+
+return lRet
+
+//-------------------------------------------------------------------
+/*/{Protheus.doc} GravarFormularios
+Grava formulários nas tabelas ZQA/ZQB
+@type function
+@author Daniel Ribeiro de Oliveira
+@since 07/09/2025
+@param oPreColl - Dados do pré-colaborador
+@param cIdMatch - ID do match
+@param cCpf - CPF do candidato
+@param cCurriculo - Código do currículo
+@return logical .T. se gravado com sucesso
+/*/
+//-------------------------------------------------------------------
+Static Function GravarFormularios(oPreColl, cIdMatch, cCpf, cCurriculo)
+
+    local lRet          as logical
+    local aForms        as array
+    local nI            as numeric
+    local nJ            as numeric
+    local cNomeForm     as character
+    local aAnswers      as array
+    local cIdZQA        as character
+
+    lRet := .T.
+
+    // Verificar se existem formulários
+    if !oPreColl:hasProperty("forms")
+        ConOut("[GRAVAR-FORMS] Nenhum formulário encontrado")
+        return .T.
+    endif
+
+    if ValType(oPreColl['forms']) != "A"
+        ConOut("[GRAVAR-FORMS] Forms não são um array")
+        return .T.
+    endif
+
+    aForms := oPreColl['forms']
+
+    ConOut("[GRAVAR-FORMS] Processando " + cValToChar(Len(aForms)) + " formulários")
+
+    for nI := 1 to Len(aForms)
+
+        // Extrair nome do formulário
+        cNomeForm := ""
+        if aForms[nI]:hasProperty("name")
+            cNomeForm := AllTrim(aForms[nI]['name'])
+        endif
+
+        // Gravar cabeçalho do formulário (ZQA)
+        cIdZQA := GravarZQA(cIdMatch, cCpf, cCurriculo, cValToChar(nI), cNomeForm)
+
+        if Empty(cIdZQA)
+            ConOut("[GRAVAR-FORMS] Erro ao gravar ZQA para formulário: " + cNomeForm)
+            lRet := .F.
+            exit
+        endif
+
+        // Gravar respostas (ZQB)
+        if aForms[nI]:hasProperty("answers")
+            if ValType(aForms[nI]['answers']) == "A"
+                aAnswers := aForms[nI]['answers']
+
+                for nJ := 1 to Len(aAnswers)
+                    if !GravarZQB(cIdZQA, aAnswers[nJ])
+                        ConOut("[GRAVAR-FORMS] Erro ao gravar ZQB")
+                        lRet := .F.
+                        exit
+                    endif
+                next nJ
+            endif
+        endif
+
+        if !lRet
+            exit
+        endif
+
+    next nI
+
+return lRet
+
+//-------------------------------------------------------------------
+/*/{Protheus.doc} GravarZQA
+Grava cabeçalho do formulário na ZQA
+@type function
+@author Daniel Ribeiro de Oliveira
+@since 07/09/2025
+@param cIdMatch - ID do match
+@param cCpf - CPF do candidato
+@param cCurriculo - Código do currículo
+@param cIdQuest - ID do questionário
+@param cNomeQuest - Nome do questionário
+@return character ID gerado na ZQA
+/*/
+//-------------------------------------------------------------------
+Static Function GravarZQA(cIdMatch, cCpf, cCurriculo, cIdQuest, cNomeQuest)
+
+    local cId       as character
+    
+    ChkFile("ZQA")
+
+    // Gerar próximo ID usando GetSxeNum
+    cId := GetSxeNum("ZQA", "ZQA_ID")
+    ConfirmSx8()
+
+    DbSelectArea("ZQA")
+
+    RecLock("ZQA", .T.)
+
+        ZQA->ZQA_FILIAL    := xFilial("ZQA")
+        ZQA->ZQA_ID        := cId
+        ZQA->ZQA_IDMATC    := PadR(cIdMatch, TamSX3("ZQA_IDMATC")[1])
+        ZQA->ZQA_CPF       := PadR(cCpf, TamSX3("ZQA_CPF")[1])
+        ZQA->ZQA_CURRICULO := PadR(cCurriculo, TamSX3("ZQA_CURRICULO")[1])
+        ZQA->ZQA_IDQUEST   := PadR(cIdQuest, TamSX3("ZQA_IDQUEST")[1])
+        ZQA->ZQA_NOME      := PadR(cNomeQuest, TamSX3("ZQA_NOME")[1])
+        ZQA->ZQA_DTINCL    := Date()
+        ZQA->ZQA_HRINCL    := Time()
+        ZQA->ZQA_USUARI    := RetCodUsr()
+
+    ZQA->(MsUnlock())
+
+    ConOut("[GRAVAR-ZQA] Formulário gravado - ID: " + cId)
+
+return cId
+
+//-------------------------------------------------------------------
+/*/{Protheus.doc} GravarZQB
+Grava resposta na ZQB
+@type function
+@author Daniel Ribeiro de Oliveira
+@since 07/09/2025
+@param cIdZQA - ID do questionário na ZQA
+@param oAnswer - Dados da resposta
+@return logical .T. se gravado com sucesso
+/*/
+//-------------------------------------------------------------------
+Static Function GravarZQB(cIdZQA, oAnswer)
+
+    local lRet          as logical
+    local cId           as character
+    local cFieldName    as character
+    local cAnswer       as character
+    local cExtName      as character
+
+    ChkFile("ZQB")
+    
+    lRet := .T.
+
+    // Extrair dados da resposta baseado no payload real
+    cFieldName := ""
+    cAnswer := ""
+    cExtName := ""
+
+    if oAnswer:hasProperty("fieldName")
+        cFieldName := AllTrim(oAnswer['fieldName'])
+    endif
+
+    if oAnswer:hasProperty("answer")
+        cAnswer := AllTrim(cValToChar(oAnswer['answer']))
+    endif
+
+    if oAnswer:hasProperty("externalName")
+        if oAnswer['externalName'] != nil
+            cExtName := AllTrim(cValToChar(oAnswer['externalName']))
+        endif
+    endif
+
+    // Gerar próximo ID usando GetSxeNum
+    cId := GetSxeNum("ZQB", "ZQB_ID")
+    ConfirmSx8()
+
+    DbSelectArea("ZQB")
+
+    RecLock("ZQB", .T.)
+
+        ZQB->ZQB_FILIAL  := xFilial("ZQB")
+        ZQB->ZQB_ID      := cId
+        ZQB->ZQB_IDQUEST := cIdZQA
+        ZQB->ZQB_IDPERG  := PadR(cFieldName, TamSX3("ZQB_IDPERG")[1])
+        ZQB->ZQB_PERGUNT := PadR(cFieldName, TamSX3("ZQB_PERGUNT")[1])
+        ZQB->ZQB_RESPOSTA:= cAnswer
+        ZQB->ZQB_EXTNAME := PadR(cExtName, TamSX3("ZQB_EXTNAME")[1])
+        ZQB->ZQB_DTINCL  := Date()
+        ZQB->ZQB_HRINCL  := Time()
+
+    ZQB->(MsUnlock())
+
+return lRet
+
+//-------------------------------------------------------------------
+/*/{Protheus.doc} ValidarDadosObrigatorios
+Valida se o match possui dados obrigatórios para SQG
+@type function
+@author Daniel Ribeiro de Oliveira
+@since 07/09/2025
+@param oMatch - Dados do match
+@return logical .T. se válido
+/*/
+//-------------------------------------------------------------------
+Static Function ValidarDadosObrigatorios(oMatch)
+
+    local lRet  as logical
+    local cCpf  as character
+    local cNome as character
+
+    lRet := .T.
+
+    // Validar CPF (obrigatório para SQG)
+    cCpf := ""
+    if oMatch:hasProperty("cpf")
+        cCpf := AllTrim(oMatch['cpf'])
+        cCpf := StrTran(StrTran(StrTran(cCpf, ".", ""), "-", ""), "/", "")
+    endif
+
+    if Empty(cCpf) .or. Len(cCpf) != 11
+        ConOut("[VALIDAR-DADOS] CPF inválido ou não informado: " + cCpf)
+        return .F.
+    endif
+
+    // Validar Nome (obrigatório para SQG)
+    cNome := ""
+    if oMatch:hasProperty("name")
+        cNome := AllTrim(oMatch['name'])
+    endif
+
+    if Empty(cNome)
+        ConOut("[VALIDAR-DADOS] Nome não informado")
+        return .F.
+    endif
+
+    ConOut("[VALIDAR-DADOS] Dados válidos - Nome: " + cNome + " CPF: " + cCpf)
+
+return lRet
+
+//-------------------------------------------------------------------
+/*/{Protheus.doc} CriarVagaGenerica
+Cria vaga genérica conforme regra de negócio
+@type function
+@author Daniel Ribeiro de Oliveira
+@since 07/09/2025
+@return object Objeto com dados da vaga genérica
+/*/
+//-------------------------------------------------------------------
+Static Function CriarVagaGenerica()
+
+    local oVaga := JsonObject():new()
+
+    // Vaga genérica com 99 vagas conforme regra de negócio
+    oVaga['id'] := "GENERICA"
+    oVaga['title'] := "Vaga Genérica - Pandapé"
+    oVaga['description'] := "Vaga criada automaticamente para candidatos do Pandapé"
+    oVaga['vacancies'] := 99
+    oVaga['area'] := "001"  // Área padrão
+    oVaga['department'] := "GERAL"
+
+    ConOut("[CRIAR-VAGA] Vaga genérica criada com 99 posições")
+
+return oVaga
+
+//-------------------------------------------------------------------
+/*/{Protheus.doc} ProcessarCandidato
+Processa dados nas tabelas padrão SQG/SQS + específicas ZEX/ZES/ZSK
+@type function
+@author Daniel Ribeiro de Oliveira
+@since 07/09/2025
+@param oMatch - Dados do match (CPF, experiências, estudos)
+@param oPreColl - Dados do pré-colaborador (formulários)
+@param oVaga - Dados da vaga
+@param cIdMatch - ID do match
+@return logical .T. se processado com sucesso
+/*/
+//-------------------------------------------------------------------
+Static Function ProcessarCandidato(oMatch, oPreColl, oVaga, cIdMatch)
+
+    local lRet          as logical
+    local cCpf          as character
+    local cNome         as character
+    local cCurriculo    as character
+    local cVaga         as character
+
+    lRet := .T.
+
+    // Extrair dados básicos do match
+    cCpf := AllTrim(oMatch['cpf'])
+    cCpf := StrTran(StrTran(StrTran(cCpf, ".", ""), "-", ""), "/", "")
+    
+    cNome := AllTrim(oMatch['name'])
+    if oMatch:hasProperty("surname")
+        cNome += " " + AllTrim(oMatch['surname'])
+    endif
+
+    ConOut("[PROCESSAR-CAND] Processando candidato: " + cNome + " CPF: " + cCpf)
+
+    begin transaction
+
+        // 1. OBRIGATÓRIO: SQS - Gravar/validar vaga padrão
+        cVaga := GravarSQS(oVaga, cIdMatch)
+        if Empty(cVaga)
+            DisarmTransaction()
+            ConOut("[PROCESSAR-CAND] ERRO: Falha ao gravar SQS (obrigatória)")
+            return .F.
+        endif
+
+        // 2. OBRIGATÓRIO: SQG - Gravar currículo padrão
+        cCurriculo := GravarSQG(oMatch, cCpf, cVaga)
+        if Empty(cCurriculo)
+            DisarmTransaction()
+            ConOut("[PROCESSAR-CAND] ERRO: Falha ao gravar SQG (obrigatória)")
+            return .F.
+        endif
+
+        // // 3. OPCIONAL: ZEX - Experiências profissionais específicas
+        // if !GravarZEX(oMatch, cCpf, cCurriculo)
+        //     ConOut("[PROCESSAR-CAND] WARNING: Erro ao gravar ZEX (opcional)")
+        // endif
+
+        // // 4. OPCIONAL: ZES - Estudos específicos
+        // if !GravarZES(oMatch, cCpf, cCurricul
+        //     ConOut("[PROCESSAR-CAND] WARNING: Erro ao gravar ZES (opcional)")
+        // endif
+
+        // // 5. OPCIONAL: ZSK - Skills específicas
+        // if !GravarZSK(oMatch, cCpf, cCurriculo)
+        //     ConOut("[PROCESSAR-CAND] WARNING: Erro ao gravar ZSK (opcional)")
+        // endif
+
+        // 6. OPCIONAL: ZQA/ZQB - Formulários de admissão
+        // if !GravarFormularios(oPreColl, cIdMatch, cCpf, cCurriculo)
+        //     ConOut("[PROCESSAR-CAND] WARNING: Erro ao gravar formulários")
+        // endif
+
+        ConOut("[PROCESSAR-CAND] Candidato processado - Currículo: " + cCurriculo + " Vaga: " + cVaga)
+
+    end transaction
+
+return lRet
+
+//-------------------------------------------------------------------
+/*/{Protheus.doc} GravarSQS
+Grava vaga na tabela padrão SQS - Cadastro de Vagas
+@type function
+@author Daniel Ribeiro de Oliveira
+@since 07/09/2025
+@param oVaga - Dados da vaga
+@param cIdMatch - ID do match
+@return character Código da vaga criada
+/*/
+//-------------------------------------------------------------------
+Static Function GravarSQS(oVaga, cIdMatch)
+
+    local cVaga         as character
+    local cDescricao    as character
+    local nNumVagas     as numeric
+    local cArea         as character
+    local cCreationDate as character
+
+    oVaga := oVaga[1]
+    // Verificar se vaga já existe
+    cVaga := PadR("PAN" + cIdMatch, TamSX3("QS_VAGA")[1])
+    
+    DbSelectArea("SQS")
+    SQS->(DbSetOrder(1)) // QS_FILIAL+QS_VAGA
+
+    if SQS->(DbSeek(xFilial("SQS") + cVaga))
+        ConOut("[GRAVAR-SQS] Vaga já existe: " + cVaga)
+        return AllTrim(cVaga)
+    endif
+
+    // Gerar novo código se necessário
+    if Empty(cVaga) .or. Len(AllTrim(cVaga)) > TamSX3("QS_VAGA")[1]
+        cVaga := GetSxeNum("SQS", "QS_VAGA")
+        ConfirmSx8()
+    endif
+
+    // Extrair dados da vaga
+    cDescricao := "Vaga Pandapé - " + cIdMatch
+    nNumVagas := 99  // Padrão conforme regra
+    cArea := "001"   // Área padrão
+
+    if oVaga:hasProperty("requestTitle")
+        cDescricao := AllTrim(oVaga['requestTitle'])
+    endif
+
+    if oVaga:hasProperty("vacanciesCount")
+        nNumVagas := oVaga['vacanciesCount']
+    endif
+
+    if oVaga:hasProperty("creationDate")
+        cCreationDate := oVaga['creationDate']
+    endif
+
+    RecLock("SQS", .T.)
+    
+        SQS->QS_FILIAL  := xFilial("SQS")
+        SQS->QS_VAGA    := cVaga
+        SQS->QS_DESCRIC := PadR(cDescricao, TamSX3("QS_DESCRIC")[1])
+        SQS->QS_AREA    := PadR(cArea, TamSX3("QS_AREA")[1])
+        SQS->QS_NRVAGA  := nNumVagas
+        SQS->QS_DTABERT := Date()
+        SQS->QS_TIPO    := "3"  // 3=Externa
+        SQS->QS_SOLICIT := PadR("PANDAPE", TamSX3("QS_SOLICIT")[1])
+    
+    SQS->(MsUnlock())
+    
+    ConOut("[GRAVAR-SQS] Vaga criada - Código: " + cVaga + " Descrição: " + cDescricao)
+
+return AllTrim(cVaga)
+
+//-------------------------------------------------------------------
+/*/{Protheus.doc} GravarSQG
+Grava currículo na tabela padrão SQG - Cadastro de Currículo
+@type function
+@author Daniel Ribeiro de Oliveira
+@since 07/09/2025
+@param oMatch - Dados do match
+@param cCpf - CPF do candidato
+@param cVaga - Código da vaga
+@return character Código do currículo criado
+/*/
+//-------------------------------------------------------------------
+Static Function GravarSQG(oMatch, cCpf, cVaga)
+
+    local cCurriculo    as character
+    local cNome         as character
+    local cSobrenome    as character
+    local dNascimento   as date
+    local cSexo         as character
+    local cData         as character
+    local cEmail        as character
+    local cTelefone     as character
+    local cCep          as character
+    local cEndereco     as character
+    local cComplemento  as character
+    local cCidade       as character
+    local cUF           as character
+    local cEstCivil     as character
+    local nSalMin       as numeric
+    local nSalMax       as numeric
+
+    // Verificar se currículo já existe pelo CPF
+    DbSelectArea("SQG")
+    SQG->(DbSetOrder(2)) // Por CPF se existir, senão usar ordem 1
+
+    cCurriculo := ""
+    
+    // Buscar por CPF se campo existir
+    if SQG->(FieldPos("QG_CIC")) > 0
+        SQG->(DbGoTop())
+        while !SQG->(Eof())
+            if AllTrim(SQG->QG_CIC) == cCpf
+                cCurriculo := AllTrim(SQG->QG_CURRIC)
+                exit
+            endif
+            SQG->(DbSkip())
+        enddo
+    endif
+
+    // Se não encontrou, gerar novo código
+    if Empty(cCurriculo)
+        cCurriculo := GetSxeNum("SQG", "QG_CURRIC")
+        ConfirmSx8()
+    endif
+
+    // Extrair dados básicos do match
+    cNome := ""
+    cSobrenome := ""
+    dNascimento := CToD("//")
+    cSexo := ""
+    cEmail := ""
+    cTelefone := ""
+    cCep := ""
+    cEndereco := ""
+    cComplemento := ""
+    cCidade := ""
+    cUF := ""
+    cEstCivil := ""
+    nSalMin := 0
+    nSalMax := 0
+
+    if oMatch:hasProperty("name")
+        cNome := AllTrim(oMatch['name'])
+    endif
+
+    if oMatch:hasProperty("surname")
+        cSobrenome := AllTrim(oMatch['surname'])
+    endif
+
+    if oMatch:hasProperty("birthDate")
+        cData := AllTrim(oMatch['birthDate'])
+        if !Empty(cData)
+            // Formato: 1988-01-10T00:00:00
+            dNascimento := SToD(SubStr(cData, 1, 4) + SubStr(cData, 6, 2) + SubStr(cData, 9, 2))
+        endif
+    endif
+
+    if oMatch:hasProperty("idSex")
+        // 1=Masculino, 2=Feminino
+        cSexo := if(oMatch['idSex'] == 1, "M", if(oMatch['idSex'] == 2, "F", ""))
+    endif
+
+    if oMatch:hasProperty("email")
+        cEmail := AllTrim(oMatch['email'])
+    endif
+
+    if oMatch:hasProperty("phone")
+        cTelefone := AllTrim(oMatch['phone'])
+    endif
+
+    if oMatch:hasProperty("cep")
+        cCep := AllTrim(oMatch['cep'])
+    endif
+
+    if oMatch:hasProperty("address")
+        cEndereco := AllTrim(oMatch['address'])
+    endif
+
+    if oMatch:hasProperty("addressComplement")
+        cComplemento := AllTrim(oMatch['addressComplement'])
+    endif
+
+    if oMatch:hasProperty("location3")
+        cCidade := AllTrim(oMatch['location3'])
+        // Extrair UF se formato "São Paulo - SP"
+        if " - " $ cCidade
+            cUF := Right(cCidade, 2)
+            cCidade := Left(cCidade, At(" - ", cCidade) - 1)
+        endif
+    endif
+
+    if oMatch:hasProperty("maritalStatus")
+        cEstCivil := AllTrim(oMatch['maritalStatus'])
+    endif
+
+    if oMatch:hasProperty("salaryMin")
+        nSalMin := oMatch['salaryMin']
+    endif
+
+    if oMatch:hasProperty("salaryMax")
+        nSalMax := oMatch['salaryMax']
+    endif
+
+    // Gravar/atualizar SQG
+    SQG->(DbSetOrder(1)) // QG_FILIAL+QG_CURRIC
+    
+    if SQG->(DbSeek(xFilial("SQG") + cCurriculo))
+        RecLock("SQG", .F.)
+    else
+        RecLock("SQG", .T.)
+        SQG->QG_FILIAL := xFilial("SQG")
+        SQG->QG_CURRIC := cCurriculo
+    endif
+
+    // Campos obrigatórios
+    SQG->QG_NOME     := PadR(cNome + " " + cSobrenome, TamSX3("QG_NOME")[1])
+    SQG->QG_AREA     := PadR("001", TamSX3("QG_AREA")[1])  // Área padrão
+    
+    // Campos opcionais disponíveis
+    if SQG->(FieldPos("QG_CIC")) > 0
+        SQG->QG_CIC := PadR(cCpf, TamSX3("QG_CIC")[1])
+    endif
+    
+    if SQG->(FieldPos("QG_DTNASC")) > 0
+        SQG->QG_DTNASC := dNascimento
+    endif
+    
+    if SQG->(FieldPos("QG_SEXO")) > 0
+        SQG->QG_SEXO := cSexo
+    endif
+    
+    if SQG->(FieldPos("QG_EMAIL")) > 0
+        SQG->QG_EMAIL := PadR(cEmail, TamSX3("QG_EMAIL")[1])
+    endif
+    
+    if SQG->(FieldPos("QG_FONE")) > 0
+        SQG->QG_FONE := PadR(cTelefone, TamSX3("QG_FONE")[1])
+    endif
+    
+    if SQG->(FieldPos("QG_CEP")) > 0
+        SQG->QG_CEP := PadR(cCep, TamSX3("QG_CEP")[1])
+    endif
+    
+    if SQG->(FieldPos("QG_ENDEREC")) > 0
+        SQG->QG_ENDEREC := PadR(cEndereco, TamSX3("QG_ENDEREC")[1])
+    endif
+    
+    if SQG->(FieldPos("QG_COMPLEM")) > 0
+        SQG->QG_COMPLEM := PadR(cComplemento, TamSX3("QG_COMPLEM")[1])
+    endif
+    
+    if SQG->(FieldPos("QG_MUNICIP")) > 0
+        SQG->QG_MUNICIP := PadR(cCidade, TamSX3("QG_MUNICIP")[1])
+    endif
+    
+    if SQG->(FieldPos("QG_ESTADO")) > 0
+        SQG->QG_ESTADO := PadR(cUF, TamSX3("QG_ESTADO")[1])
+    endif
+    
+    if SQG->(FieldPos("QG_ESTCIV")) > 0
+        SQG->QG_ESTCIV := PadR(Left(cEstCivil,1), TamSX3("QG_ESTCIV")[1])
+    endif
+    
+    if SQG->(FieldPos("QG_PRETSAL")) > 0
+        SQG->QG_PRETSAL := nSalMax
+    endif
+    
+    if SQG->(FieldPos("QG_VAGA")) > 0
+        SQG->QG_VAGA := PadR(cVaga, TamSX3("QG_VAGA")[1])
+    endif
+    
+    // Controle padrão
+    SQG->QG_DTCAD    := Date()
+    
+    if SQG->(FieldPos("QG_SITUAC")) > 0
+        SQG->QG_SITUAC := "001"  // Disponível
+    endif
+
+    SQG->(MsUnlock())
+
+    ConOut("[GRAVAR-SQG] Currículo gravado - Código: " + cCurriculo)
+
+return cCurriculo
+
+//-------------------------------------------------------------------
+/*/{Protheus.doc} GravarZEX
+Grava experiências na tabela específica ZEX
+@type function
+@author Daniel Ribeiro de Oliveira
+@since 07/09/2025
+@param oMatch - Dados do match
+@param cCpf - CPF do candidato
+@param cCurriculo - Código do currículo
+@return logical .T. se gravado com sucesso
+/*/
+//-------------------------------------------------------------------
+Static Function GravarZEX(oMatch, cCpf, cCurriculo)
+
+    local lRet          as logical
+    local aExperiences  as array
+    local nI            as numeric
+    local cId           as character
+
+    lRet := .T.
+
+    // Verificar se existem experiências
+    if !oMatch:hasProperty("experiences")
+        ConOut("[GRAVAR-ZEX] Nenhuma experiência encontrada")
+        return .T.
+    endif
+
+    if ValType(oMatch['experiences']) != "A"
+        ConOut("[GRAVAR-ZEX] Experiências não são um array")
+        return .T.
+    endif
+
+    aExperiences := oMatch['experiences']
+
+    ConOut("[GRAVAR-ZEX] Processando " + cValToChar(Len(aExperiences)) + " experiências")
+
+    for nI := 1 to Len(aExperiences)
+
+        cId := GetSxeNum("ZEX", "ZEX_ID")
+        ConfirmSx8()
+
+        DbSelectArea("ZEX")
+        RecLock("ZEX", .T.)
+
+            ZEX->ZEX_FILIAL    := xFilial("ZEX")
+            ZEX->ZEX_ID        := cId
+            ZEX->ZEX_CURRICULO := PadR(cCurriculo, TamSX3("ZEX_CURRICULO")[1])
+            ZEX->ZEX_CPF       := PadR(cCpf, TamSX3("ZEX_CPF")[1])
+            
+            if aExperiences[nI]:hasProperty("company")
+                ZEX->ZEX_EMPRESA := PadR(AllTrim(aExperiences[nI]['company']), TamSX3("ZEX_EMPRESA")[1])
+            endif
+            
+            if aExperiences[nI]:hasProperty("job")
+                ZEX->ZEX_CARGO := PadR(AllTrim(aExperiences[nI]['job']), TamSX3("ZEX_CARGO")[1])
+            endif
+            
+            if aExperiences[nI]:hasProperty("description")
+                ZEX->ZEX_DESCRICAO := AllTrim(aExperiences[nI]['description'])
+            endif
+            
+            if aExperiences[nI]:hasProperty("salary")
+                ZEX->ZEX_SALARIO := aExperiences[nI]['salary']
+            endif
+            
+            if aExperiences[nI]:hasProperty("beginDate")
+                if !Empty(aExperiences[nI]['beginDate'])
+                    ZEX->ZEX_DTINI := CToD(SubStr(aExperiences[nI]['beginDate'], 1, 10))
+                endif
+            endif
+            
+            if aExperiences[nI]:hasProperty("endDate")
+                if aExperiences[nI]['endDate'] != nil .and. !Empty(aExperiences[nI]['endDate'])
+                    ZEX->ZEX_DTFIM := CToD(SubStr(aExperiences[nI]['endDate'], 1, 10))
+                    ZEX->ZEX_ATUAL := "N"
+                else
+                    ZEX->ZEX_ATUAL := "S"  // Emprego atual
+                endif
+            endif
+            
+            ZEX->ZEX_DTINCL := Date()
+            ZEX->ZEX_HRINCL := Time()
+
+        ZEX->(MsUnlock())
+
+    next nI
+
+return lRet

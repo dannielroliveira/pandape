@@ -1,0 +1,544 @@
+#include "totvs.ch"
+#include "tlpp-core.th"
+
+//-------------------------------------------------------------------
+/*/{Protheus.doc} PANDAPE
+Classe para integração com API do Pandapé
+@type class
+@author Daniel Ribeiro de Oliveira
+@since 07/09/2025
+@version 1.0
+/*/
+//-------------------------------------------------------------------
+
+namespace pandape.api
+
+class PANDAPE
+
+    public data cBaseUrl       as character
+    public data cAuthUrl       as character
+    public data cClientId      as character
+    public data cSecret        as character
+    public data cToken         as character
+    public data oRest          as object
+    public data lDebug         as logical
+    public data nTimeout       as numeric
+
+    public method new() constructor
+    public method setCredentials(cClientId, cSecret)
+    public method authenticate()
+    public method getPreCollaborator(cIdPreCollaborator)
+    public method getMatch(cIdMatch)
+    public method getVacancy(cIdVacancy)
+    public method getRequest(cIdRequest)
+    public method doRequest(cMethod, cEndpoint, oJsonSend)
+    public method logDebug(cMessage)
+    public method isAuthenticated()
+
+endclass
+
+//-------------------------------------------------------------------
+/*/{Protheus.doc} new
+Construtor da classe
+@type method
+@author Daniel Ribeiro de Oliveira
+@since 07/09/2025
+/*/
+//-------------------------------------------------------------------
+method new() class PANDAPE
+
+    local cUrlBase  as character
+    local cUrlAuth  as character
+    local cCliId    as character
+    local cSecr     as character
+    local lDeb      as logical
+
+    // Obter configurações dos parâmetros
+    cUrlBase := SuperGetMV("MV_PANDURL", .f., "https://api.pandape.com.br")
+    cUrlAuth := SuperGetMV("MV_PANDAUT", .f., "https://login.pandape.com.br")
+    cCliId   := SuperGetMV("MV_PANDCLI", .f., "PronutriPremiumRefeicoesApiClient")
+    cSecr    := SuperGetMV("MV_PANDSEC", .f., "9216cab101494fd9ad72")
+    lDeb     := SuperGetMV("MV_PANDDEB", .f., .F.)
+
+    ::cBaseUrl   := AllTrim(cUrlBase)
+    ::cAuthUrl   := AllTrim(cUrlAuth)
+    ::cClientId  := AllTrim(cCliId)
+    ::cSecret    := AllTrim(cSecr)
+    ::cToken     := ""
+    ::oRest      := FWRest():New()
+    ::lDebug     := lDeb
+    ::nTimeout   := 30
+
+    // Configurações do REST client
+    ::oRest:setPath("")
+    ::oRest:SetPostParams("")
+
+    ::logDebug("Classe PANDAPE inicializada")
+    ::logDebug("API URL: " + ::cBaseUrl)
+    ::logDebug("Auth URL: " + ::cAuthUrl)
+
+return self
+
+//-------------------------------------------------------------------
+/*/{Protheus.doc} setCredentials
+Define as credenciais para acesso à API
+@type method
+@author Daniel Ribeiro de Oliveira
+@since 07/09/2025
+@param cClientId - Client ID para autenticação
+@param cSecret - Secret para autenticação
+/*/
+//-------------------------------------------------------------------
+method setCredentials(cClientId, cSecret) class PANDAPE
+
+    ::cClientId := AllTrim(cClientId)
+    ::cSecret   := AllTrim(cSecret)
+
+    ::logDebug("Credenciais atualizadas - Client ID: " + ::cClientId)
+
+return
+
+//-------------------------------------------------------------------
+/*/{Protheus.doc} authenticate
+Realiza autenticação na API e obtém token de acesso
+@type method
+@author Daniel Ribeiro de Oliveira
+@since 07/09/2025
+@return logical Sucesso da autenticação
+/*/
+//-------------------------------------------------------------------
+method authenticate() class PANDAPE
+
+    local lRet          as logical
+    local oResponse     as json
+    local cEndpoint     as character
+    local cAuth         as character
+    local cPostData     as character
+    local cResponse     as character
+    local cError        as character
+    local aHeaders      as array
+
+    lRet := .F.
+
+    ::logDebug("Iniciando autenticação na API Pandapé")
+
+
+    cEndpoint := "/connect/token"
+
+    // Preparar Basic Auth (Base64 do client_id:client_secret)
+    cAuth := Encode64(::cClientId + ":" + ::cSecret)
+
+    // Preparar dados POST em formato x-www-form-urlencoded 
+    cPostData := "grant_type=client_credentials&scope=PandapeApi"
+
+    // Preparar headers como array
+    aHeaders := {}
+    AAdd(aHeaders, "Authorization: Basic " + cAuth)
+    AAdd(aHeaders, "Content-Type: application/x-www-form-urlencoded")
+    AAdd(aHeaders, "Accept: application/json")
+
+    ::logDebug("Autenticando em: " + ::cAuthUrl + cEndpoint)
+
+    // Configurar REST client para autenticação
+    ::oRest:SetHost(::cAuthUrl)
+    ::oRest:SetPath(cEndpoint)
+    // ::oRest:SetHeaders(aHeaders)
+    ::oRest:SetPostParams(cPostData)
+
+    // Executar requisição
+    if ::oRest:Post(aHeaders)
+        cResponse := ::oRest:GetResult()
+        
+        if !Empty(cResponse)
+            oResponse := JsonObject():new()
+            cError := oResponse:fromJson(cResponse)
+            
+            if Empty(cError)
+                if oResponse:hasProperty("access_token")
+                    ::cToken := oResponse['access_token']
+                    ::logDebug("Autenticação realizada com sucesso")
+                    lRet := .T.
+                else
+                    ::logDebug("Erro: Token não encontrado na resposta")
+                endif
+            else
+                ::logDebug("Erro no parse JSON: " + cError)
+            endif
+        else
+            ::logDebug("Resposta vazia da autenticação")
+        endif
+    else
+        ::logDebug("Erro na requisição de autenticação: " + ::oRest:GetLastError())
+    endif
+
+return lRet
+
+//-------------------------------------------------------------------
+/*/{Protheus.doc} getPreCollaborator
+Busca dados completos do pré-colaborador
+@type method
+@author Daniel Ribeiro de Oliveira
+@since 07/09/2025
+@param cIdPreCollaborator - ID do pré-colaborador
+@return object Dados do pré-colaborador ou nil se erro
+/*/
+//-------------------------------------------------------------------
+method getPreCollaborator(cIdPreCollaborator) class PANDAPE
+
+    local oResponse     as json
+    local cEndpoint     as character
+
+    ::logDebug("Buscando pré-colaborador: " + cIdPreCollaborator)
+
+    // Verificar autenticação
+    if !::isAuthenticated()
+        if !::authenticate()
+            ::logDebug("Erro: Não foi possível autenticar")
+            return nil
+        endif
+    endif
+
+    cEndpoint := "/v3/precollaborators/" + AllTrim(cIdPreCollaborator)
+
+    oResponse := ::doRequest("GET", cEndpoint, nil)
+
+    if oResponse != nil
+        ::logDebug("Pré-colaborador encontrado com sucesso")
+    else
+        ::logDebug("Erro ao buscar pré-colaborador")
+    endif
+
+return oResponse
+
+//-------------------------------------------------------------------
+/*/{Protheus.doc} getMatch
+Busca dados do match (relacionamento candidato x vaga)
+@type method
+@author Daniel Ribeiro de Oliveira
+@since 07/09/2025
+@param cIdMatch - ID do match
+@return object Dados do match ou nil se erro
+/*/
+//-------------------------------------------------------------------
+method getMatch(cIdMatch) class PANDAPE
+
+    local oResponse     as json
+    local cEndpoint     as character
+
+    ::logDebug("Buscando match: " + cIdMatch)
+
+    // Verificar autenticação
+    if !::isAuthenticated()
+        if !::authenticate()
+            ::logDebug("Erro: Não foi possível autenticar")
+            return nil
+        endif
+    endif
+
+    cEndpoint := "/v2/matches/" + AllTrim(cIdMatch)
+
+    oResponse := ::doRequest("GET", cEndpoint, nil)
+
+    if oResponse != nil
+        ::logDebug("Match encontrado com sucesso")
+    else
+        ::logDebug("Erro ao buscar match")
+    endif
+
+return oResponse
+
+//-------------------------------------------------------------------
+/*/{Protheus.doc} getVacancy
+Busca dados da vaga
+@type method
+@author Daniel Ribeiro de Oliveira
+@since 07/09/2025
+@param cIdVacancy - ID da vaga
+@return object Dados da vaga ou nil se erro
+/*/
+//-------------------------------------------------------------------
+method getVacancy(cIdVacancy) class PANDAPE
+
+    local oResponse     as json
+    local cEndpoint     as character
+
+    ::logDebug("Buscando vaga: " + cIdVacancy)
+
+    // Verificar autenticação
+    if !::isAuthenticated()
+        if !::authenticate()
+            ::logDebug("Erro: Não foi possível autenticar")
+            return nil
+        endif
+    endif
+
+    // cEndpoint := "/v2/vacancies/" + AllTrim(cIdVacancy) ?idVacancy=
+    
+    cEndpoint := "/v2/requests?idVacancy="+AllTrim(cIdVacancy)+"&includeArchivedRequest=true"
+
+    oResponse := ::doRequest("GET", cEndpoint, nil)
+
+    if oResponse != nil
+        ::logDebug("Vaga encontrada com sucesso")
+    else
+        ::logDebug("Erro ao buscar vaga")
+    endif
+
+return oResponse
+
+//-------------------------------------------------------------------
+/*/{Protheus.doc} getRequest
+Busca dados da requisição
+@type method
+@author Daniel Ribeiro de Oliveira
+@since 07/09/2025
+@param cIdRequest - ID da requisição
+@return object Dados da requisição ou nil se erro
+/*/
+//-------------------------------------------------------------------
+method getRequest(cIdRequest) class PANDAPE
+
+    local oResponse     as json
+    local cEndpoint     as character
+
+    ::logDebug("Buscando requisição: " + cIdRequest)
+
+    // Verificar autenticação
+    if !::isAuthenticated()
+        if !::authenticate()
+            ::logDebug("Erro: Não foi possível autenticar")
+            return nil
+        endif
+    endif
+
+    cEndpoint := "/v2/requests/" + AllTrim(cIdRequest)
+
+    oResponse := ::doRequest("GET", cEndpoint, nil)
+
+    if oResponse != nil
+        ::logDebug("Requisição encontrada com sucesso")
+    else
+        ::logDebug("Erro ao buscar requisição")
+    endif
+
+return oResponse
+
+//-------------------------------------------------------------------
+/*/{Protheus.doc} doRequest
+Executa requisição HTTP para a API
+@type method
+@author Daniel Ribeiro de Oliveira
+@since 07/09/2025
+@param cMethod - Método HTTP (GET, POST, etc)
+@param cEndpoint - Endpoint da API
+@param oJsonSend - JSON para envio (opcional)
+@return object Resposta da API ou nil se erro
+/*/
+//-------------------------------------------------------------------
+method doRequest(cMethod, cEndpoint, oJsonSend) class PANDAPE
+
+    local oJson         as json
+    local cUrl          as character
+    local cResponse     as character
+    local cError        as character
+    local aHeaders      as array
+    local cHost         as character
+
+    cUrl := ::cBaseUrl + cEndpoint
+
+    ::logDebug("Executando requisição: " + cMethod + " " + cUrl)
+
+    // Extrair host da URL
+    cHost := SubStr(::cBaseUrl, At("://", ::cBaseUrl) + 3)
+    if At("/", cHost) > 0
+        cHost := SubStr(cHost, 1, At("/", cHost) - 1)
+    endif
+
+    // Preparar headers como array
+    aHeaders := {}
+    AAdd(aHeaders, "Content-Type: application/json")
+    AAdd(aHeaders, "Accept: application/json")
+
+    if !Empty(::cToken)
+        AAdd(aHeaders, "Authorization: Bearer " + ::cToken)
+    endif
+
+    // Configurar REST client
+    ::oRest:SetHost(cHost)
+    ::oRest:SetPath(cEndpoint)
+
+    // Executar requisição conforme método
+    do case
+        case Upper(cMethod) == "GET"
+            if ::oRest:Get(aHeaders)
+                cResponse := ::oRest:GetResult()
+            else
+                ::logDebug("Erro GET: " + ::oRest:GetLastError())
+                return nil
+            endif
+
+        case Upper(cMethod) == "POST"
+            // Para requisições POST normais da API (não autenticação)
+            if oJsonSend != nil
+                ::oRest:SetPostParams(oJsonSend:toJson())
+            else
+                ::oRest:SetPostParams("")
+            endif
+
+            if ::oRest:Post(aHeaders)
+                cResponse := ::oRest:GetResult()
+            else
+                ::logDebug("Erro POST: " + ::oRest:GetLastError())
+                return nil
+            endif
+
+        case Upper(cMethod) == "PUT"
+            if oJsonSend != nil
+                ::oRest:SetPostParams(oJsonSend:toJson())
+            endif
+
+            if ::oRest:Put(aHeaders)
+                cResponse := ::oRest:GetResult()
+            else
+                ::logDebug("Erro PUT: " + ::oRest:GetLastError())
+                return nil
+            endif
+
+        case Upper(cMethod) == "DELETE"
+            if ::oRest:Delete(aHeaders)
+                cResponse := ::oRest:GetResult()
+            else
+                ::logDebug("Erro DELETE: " + ::oRest:GetLastError())
+                return nil
+            endif
+
+        otherwise
+            ::logDebug("Método HTTP não suportado: " + cMethod)
+            return nil
+    endcase
+
+    // Parse da resposta
+    if !Empty(cResponse)
+        oJson := JsonObject():new()
+        cError := oJson:fromJson(DecodeUTF8(cResponse, "cp1252"))
+
+        if !Empty(cError)
+            ::logDebug("Erro no parse JSON: " + cError)
+            ::logDebug("Response: " + Left(cResponse, 200) + "...")
+            return nil
+        endif
+
+        ::logDebug("Requisição executada com sucesso")
+    else
+        ::logDebug("Resposta vazia da API")
+        return nil
+    endif
+
+return oJson
+
+//-------------------------------------------------------------------
+/*/{Protheus.doc} isAuthenticated
+Verifica se está autenticado (possui token válido)
+@type method
+@author Daniel Ribeiro de Oliveira
+@since 07/09/2025
+@return logical .T. se autenticado
+/*/
+//-------------------------------------------------------------------
+method isAuthenticated() class PANDAPE
+
+return !Empty(::cToken)
+
+//-------------------------------------------------------------------
+/*/{Protheus.doc} logDebug
+Registra mensagens de debug no console
+@type method
+@author Daniel Ribeiro de Oliveira
+@since 07/09/2025
+@param cMessage - Mensagem para log
+/*/
+//-------------------------------------------------------------------
+method logDebug(cMessage) class PANDAPE
+
+    if ::lDebug
+        ConOut("[PANDAPE-API] " + DToC(Date()) + " " + Time() + " - " + cMessage)
+    endif
+
+return
+
+//-------------------------------------------------------------------
+/*/{Protheus.doc} U_PPTESTAUTH
+Função para testar especificamente a autenticação
+@type function
+@author Daniel Ribeiro de Oliveira
+@since 07/09/2025
+/*/
+//-------------------------------------------------------------------
+User Function PPTESTAUTH()
+
+    local oApi          as object
+    local lAuth         as logical
+    local cClientId     as character
+    local cSecret       as character
+    local xRet          as variant
+    local cIdPreCollaborator    as character
+    local cIdMatch      as character
+    local cIdVacancy    as character
+
+    cIdPreCollaborator  := "245644"    
+    cIdMatch            := "502989926"
+    cIdVacancy          := "1261399"
+
+    RPCSetType(3)
+    RPCSetEnv("03","01")
+
+    ConOut("=== TESTE DE AUTENTICAÇÃO PANDAPÉ ===")
+
+    // Obter credenciais dos parâmetros
+    cClientId := SuperGetMV("MV_PANDCLI", .f., "PronutriPremiumRefeicoesApiClient")
+    cSecret   := SuperGetMV("MV_PANDSEC", .f., "9216cab101494fd9ad72")
+
+    ConOut("Client ID: " + cClientId)
+    ConOut("Secret: " + Left(cSecret, 10) + "...")
+
+    // Instanciar classe
+    oApi := PANDAPE():new()
+
+    // Habilitar debug para ver detalhes
+    oApi:lDebug := .T.
+
+    ConOut("URLs configuradas:")
+    ConOut("- Auth: " + oApi:cAuthUrl)
+    ConOut("- API: " + oApi:cBaseUrl)
+
+    // Testar autenticação
+    ConOut("Tentando autenticar...")
+    lAuth := oApi:authenticate()
+
+    if lAuth
+        ConOut("SUCESSO: Autenticação realizada!")
+        ConOut("Token obtido: " + Left(oApi:cToken, 50) + "...")
+        
+        // Testar uma chamada simples da API
+        ConOut("Testando chamada da API...")
+        xRet := oApi:getPreCollaborator(cIdPreCollaborator)
+        memowrite("c:\temp\pandape\precollaborator.HTM",varinfo("",xRet))
+        xRet := oApi:getMatch(cIdMatch)
+        memowrite("c:\temp\pandape\match.HTM",varinfo("",xRet))
+        xRet := oApi:getVacancy(cIdVacancy)
+        memowrite("c:\temp\pandape\vacancy.HTM",varinfo("",xRet))
+
+        
+    else
+        ConOut("ERRO: Falha na autenticação")
+        ConOut("Verifique:")
+        ConOut("1. Client ID e Secret nos parâmetros")
+        ConOut("2. URLs de autenticação e API")
+        ConOut("3. Conectividade de rede")
+    endif
+
+    ConOut("=== FIM DO TESTE ===")
+
+    rpcClearEnv()
+
+return lAuth

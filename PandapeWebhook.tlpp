@@ -1,0 +1,322 @@
+#include "totvs.ch"
+#include "tlpp-core.th"
+
+//-------------------------------------------------------------------
+/*/{Protheus.doc} PandapeWebhook
+API REST para receber webhooks do Pandapé
+@type class
+@author Daniel Ribeiro de Oliveira
+@since 07/09/2025
+@version 1.0
+/*/
+//-------------------------------------------------------------------
+
+namespace pandape.webhook
+
+class PandapeWebhook from FwAdapterBaseV2
+
+    public method new() constructor
+    
+    @post('/pandape/webhook/admissao')
+    public method receberWebhook() as logical
+
+endclass
+
+//-------------------------------------------------------------------
+/*/{Protheus.doc} new
+Construtor da classe
+@type method
+@author Daniel Ribeiro de Oliveira
+@since 07/09/2025
+/*/
+//-------------------------------------------------------------------
+method new() class PandapeWebhook
+
+return self
+
+//-------------------------------------------------------------------
+/*/{Protheus.doc} receberWebhook
+Recebe webhook de candidato em admissão
+@type method
+@author Daniel Ribeiro de Oliveira
+@since 07/09/2025
+@return logical Sucesso da operação
+/*/
+//-------------------------------------------------------------------
+method receberWebhook() class PandapeWebhook
+
+    local lRPC              as logical
+    local lRet              as logical
+    local oRequest          as json
+    local jResp             as json
+    local cBody             as character
+    local cError            as character
+    local cIdZPA            as character
+    local cIdMatch          as character
+    local cIdPreColl        as character
+    local cIdVaga           as character
+    local cIdOnbFolderFrom  as character
+    local cIdOnbFolderTo    as character
+    local cOnbFolderTo      as character
+    local cIdCompanyUser    as character
+    local cEventDate        as character
+    local cEtapa            as character
+
+    private err as object
+
+    lRet := .T.
+
+    if type('cEmpAnt') <> 'C'
+        rpcSetEnv('01','01')  // [ISSUE] Corrigir para empresa/filial da Somos
+        lRPC := .T.
+    endif
+
+    cEtapa := "ADMISSÃO FINALIZADA"
+
+    try
+
+        // Obter o corpo da requisição
+        cBody := oRest:getBodyRequest()
+        
+        // Log da requisição recebida
+        ConOut("[PANDAPE-API] " + DToC(Date()) + " " + Time() + " - Webhook recebido")
+        ConOut("[PANDAPE-API] Body: " + cBody)
+        
+        // Validar se recebeu dados
+        if Empty(cBody)
+            err := errorClass():new()
+            err:description := "Corpo da requisição está vazio"
+            throw err
+        endif
+        
+        // Parse do JSON
+        oRequest := JsonObject():new()
+        cError := oRequest:fromJson(cBody)
+        
+        if !Empty(cError)
+            err := errorClass():new()
+            err:description := "JSON inválido: " + cError
+            throw err
+        endif
+        
+        // Validar campos obrigatórios do payload real
+        if !oRequest:hasProperty("IdPreCollaborator")
+            err := errorClass():new()
+            err:description := "Campo 'IdPreCollaborator' é obrigatório"
+            throw err
+        endif
+        
+        if !oRequest:hasProperty("IdMatch")
+            err := errorClass():new()
+            err:description := "Campo 'IdMatch' é obrigatório"
+            throw err
+        endif
+        
+        if !oRequest:hasProperty("IdVacancy")
+            err := errorClass():new()
+            err:description := "Campo 'IdVacancy' é obrigatório"
+            throw err
+        endif
+        
+        if !oRequest:hasProperty("OnboardingFolderTo")
+            err := errorClass():new()
+            err:description := "Campo 'OnboardingFolderTo' é obrigatório"
+            throw err
+        endif
+        
+        // Extrair dados do payload
+        cIdPreColl := AllTrim(cValToChar(oRequest['IdPreCollaborator']))
+        cIdMatch := AllTrim(cValToChar(oRequest['IdMatch']))
+        cIdVaga := AllTrim(cValToChar(oRequest['IdVacancy']))
+        cOnbFolderTo := DecodeUTF8(AllTrim(cValToChar(oRequest['OnboardingFolderTo'])))
+        
+        // Campos opcionais
+        cIdOnbFolderFrom := ""
+        cIdOnbFolderTo := ""
+        cIdCompanyUser := ""
+        cEventDate := ""
+        
+        if oRequest:hasProperty("IdOnboardingFolderFrom")
+            cIdOnbFolderFrom := AllTrim(cValToChar(oRequest['IdOnboardingFolderFrom']))
+        endif
+        
+        if oRequest:hasProperty("IdOnboardingFolderTo")
+            cIdOnbFolderTo := AllTrim(cValToChar(oRequest['IdOnboardingFolderTo']))
+        endif
+        
+        if oRequest:hasProperty("IdCompanyUser")
+            cIdCompanyUser := AllTrim(cValToChar(oRequest['IdCompanyUser']))
+        endif
+        
+        if oRequest:hasProperty("EventDate")
+            cEventDate := AllTrim(cValToChar(oRequest['EventDate']))
+        endif
+        
+        // Validar IDs obrigatórios não podem estar vazios
+        if Empty(cIdMatch) .or. Empty(cIdPreColl) .or. Empty(cIdVaga)
+            err := errorClass():new()
+            err:description := "Campos obrigatórios não podem estar vazios: IdMatch, IdPreCollaborator, IdVacancy"
+            throw err
+        endif
+        
+        // Validar se é a etapa de "Admissão finalizada"
+        if Upper(Alltrim(cOnbFolderTo)) != cEtapa
+            // Log informativo - não é erro, apenas não processamos ainda
+            ConOut("[PANDAPE-API] Etapa não processada: " + cOnbFolderTo + " - Aguardando 'Admissão finalizada'")
+            
+            jResp := JsonObject():new()
+            jResp['success'] := .T.
+            jResp['message'] := "Webhook recebido, mas etapa não requer processamento: " + cOnbFolderTo
+            jResp['stage'] := cOnbFolderTo
+            jResp['idMatch'] := cIdMatch
+            jResp['idPreCollaborator'] := cIdPreColl
+            jResp['timestamp'] := FWTimeStamp(3)
+            
+            oRest:SetResponse(jResp:toJson())
+            
+            if lRPC
+                rpcClearEnv()
+            endif
+            
+            return lRet
+        endif
+        
+        // Gravar na tabela de fila ZPA
+        cIdZPA := U_PPGRZPA(cIdMatch, cIdPreColl, cIdVaga, cIdOnbFolderFrom, cIdOnbFolderTo, ;
+                           cOnbFolderTo, cIdCompanyUser, "", cEventDate, cBody)
+        
+        if Empty(cIdZPA)
+            err := errorClass():new()
+            err:description := "Erro ao gravar na fila de processamento"
+            throw err
+        endif
+        
+        // Sucesso
+        jResp := JsonObject():new()
+        jResp['success'] := .T.
+        jResp['message'] := "Webhook recebido com sucesso - Candidato pronto para admissão"
+        jResp['queueId'] := cIdZPA
+        jResp['idMatch'] := cIdMatch
+        jResp['idPreCollaborator'] := cIdPreColl
+        jResp['idVacancy'] := cIdVaga
+        jResp['stage'] := cOnbFolderTo
+        jResp['timestamp'] := FWTimeStamp(3)
+        
+        ConOut("[PANDAPE-API] Webhook processado com sucesso - ID: " + cIdZPA)
+        ConOut("[PANDAPE-API] Candidato em admissão finalizada - IdPreCollaborator: " + cIdPreColl)
+        
+        oRest:SetResponse(jResp:toJson())
+
+    catch err
+
+        cError := err:description
+
+        ConOut("[PANDAPE-API] ERRO: " + cError)
+
+        jResp := jsonObject():new()
+        jResp['success'] := .F.
+        jResp['error'] := cError
+        jResp['timestamp'] := FWTimeStamp(3)
+
+        oRest:setFault(jResp:toJson())
+
+    endtry
+
+    if lRPC
+        rpcClearEnv()
+    endif
+
+return lRet
+
+//-------------------------------------------------------------------
+/*/{Protheus.doc} U_PPGRZPA
+Grava registro na tabela de fila ZPA
+@type function
+@author Daniel Ribeiro de Oliveira
+@since 07/09/2025
+@param cIdMatch - ID do Match
+@param cIdPreColl - ID do PreCollaborator
+@param cIdVaga - ID da Vaga
+@param cIdOnbFolderFrom - ID da pasta de origem
+@param cIdOnbFolderTo - ID da pasta de destino
+@param cOnbFolderTo - Nome da etapa de destino
+@param cIdCompanyUser - ID do usuário da empresa
+@param cIdReq - ID da Requisição
+@param cEventDate - Data do evento
+@param cJsonBody - JSON completo do webhook
+@return cId - ID gerado na ZPA ou vazio se erro
+/*/
+//-------------------------------------------------------------------
+User Function PPGRZPA(cIdMatch, cIdPreColl, cIdVaga, cIdOnbFolderFrom, cIdOnbFolderTo, ;
+                      cOnbFolderTo, cIdCompanyUser, cIdReq, cEventDate, cJsonBody)
+
+    local cId       as character
+    local aArea     as array
+    local nProxId   as numeric
+    local dEventDate as date
+    local cEventTime as character
+
+    default cIdReq := ""
+    
+    cId := ""
+    aArea := GetArea()
+    dEventDate := Date()
+    cEventTime := Time()
+    
+    // Converter data do evento se fornecida
+    if !Empty(cEventDate)
+        // Formato esperado: "2025-09-19T13:09:22.1241878"
+        if At("T", cEventDate) > 0
+            dEventDate := CToD(SubStr(cEventDate, 9, 2) + "/" + SubStr(cEventDate, 6, 2) + "/" + SubStr(cEventDate, 1, 4))
+            cEventTime := SubStr(cEventDate, 12, 8)
+        endif
+    endif
+    
+    // Gerar próximo ID sequencial usando GerSxeNum
+    cId := GetSxeNum("ZPA", "ZPA_ID")
+    
+    // Confirmar a numeração
+    ConfirmSx8()
+    
+    // Verificar se tabela ZPA existe
+    ChkFile("ZPA")
+    
+    DbSelectArea("ZPA")
+    
+    // Se houver erro na gravação, rollback da numeração
+    begin transaction
+    
+    RecLock("ZPA", .T.)
+    
+        ZPA->ZPA_FILIAL    := xFilial("ZPA")
+        ZPA->ZPA_ID        := cId
+        ZPA->ZPA_IDMATC    := PadR(cIdMatch, TamSX3("ZPA_IDMATC")[1])
+        ZPA->ZPA_IDPREC    := PadR(cIdPreColl, TamSX3("ZPA_IDPREC")[1])
+        ZPA->ZPA_IDVAGA    := PadR(cIdVaga, TamSX3("ZPA_IDVAGA")[1])
+        ZPA->ZPA_IDONFR    := PadR(cIdOnbFolderFrom, TamSX3("ZPA_IDONFR")[1])
+        ZPA->ZPA_IDONTO    := PadR(cIdOnbFolderTo, TamSX3("ZPA_IDONTO")[1])
+        ZPA->ZPA_ETAPA     := PadR(cOnbFolderTo, TamSX3("ZPA_ETAPA")[1])
+        ZPA->ZPA_IDCOMP    := PadR(cIdCompanyUser, TamSX3("ZPA_IDCOMP")[1])
+        ZPA->ZPA_IDREQ     := PadR(cIdReq, TamSX3("ZPA_IDREQ")[1])  
+        ZPA->ZPA_JSON      := cJsonBody
+        ZPA->ZPA_STATUS    := "P"  // P = Pendente
+        ZPA->ZPA_DTINCL    := Date()
+        ZPA->ZPA_HRINCL    := Time()
+        ZPA->ZPA_DTPROC    := CToD("//")
+        ZPA->ZPA_HRPROC    := ""
+        ZPA->ZPA_DTEVEN    := dEventDate  // Data do evento Pandapé
+        ZPA->ZPA_HREVEN    := cEventTime  // Hora do evento Pandapé
+        ZPA->ZPA_TENTAT    := 0
+        ZPA->ZPA_MSGERR    := ""
+        ZPA->ZPA_USUARI    := RetCodUsr()
+    
+    ZPA->(MsUnlock())
+    
+    end transaction
+    
+    ConOut("[PPGRZPA] Registro gravado na ZPA - ID: " + cId)
+    ConOut("[PPGRZPA] IdMatch: " + cIdMatch + " IdPreColl: " + cIdPreColl + " Etapa: " + cOnbFolderTo)
+    
+    RestArea(aArea)
+
+return cId
