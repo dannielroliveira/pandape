@@ -467,7 +467,7 @@ Exemplos:
 | Parâmetro | Tipo | Tam | Descrição | Padrão |
 |-----------|------|-----|-----------|--------|
 | MV_PANDCLI | C | 50 | Client ID API Pandapé | "PronutriPremiumRefeicoesApiClient" |
-| MV_PANDSEC | C | 50 | Secret API Pandapé | "9216cab101494fd9ad72" |
+| MV_PANDSEC | C | 50 | Secret API Pandapé | "****************" |
 | MV_PANDURL | C | 100 | URL base API Pandapé | "https://api.pandape.com.br" |
 | MV_PANDAUT | C | 100 | URL autenticação | "https://login.pandape.com.br" |
 | MV_PANDJOB | L | 1 | Habilita job processamento | .T. |
